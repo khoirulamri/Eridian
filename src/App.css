@@ -2246,6 +2246,57 @@ h6.md-h {
   font-size: 11px;
 }
 
+/* ── Settings → per-account archive breakdown ─────────────────────────────── */
+
+.usage-list {
+  list-style: none;
+  margin: 12px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.usage-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 11px;
+}
+.usage-row .tag {
+  flex: none;
+  min-width: 64px;
+  text-align: center;
+}
+/* Share of the largest account, so the space hog is obvious at a glance. */
+.usage-bar {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-3);
+  position: relative;
+  overflow: hidden;
+}
+.usage-bar::after {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: var(--w, 0%);
+  background: var(--cc);
+  opacity: 0.55;
+  border-radius: 3px;
+}
+.usage-n {
+  flex: none;
+  min-width: 92px;
+  text-align: right;
+}
+.usage-b {
+  flex: none;
+  min-width: 64px;
+  text-align: right;
+}
+
 /* ── Settings → Watched directories (multi-account Claude Code) ───────────── */
 
 .settings-dirs .dir-list {

@@ -10,6 +10,7 @@ mod inspect;
 mod mcp_config;
 mod normalize;
 mod paths;
+mod retention;
 mod shell;
 mod skills_config;
 mod store;
@@ -101,6 +102,7 @@ pub fn run() {
             commands::db_info,
             commands::get_settings,
             commands::set_settings,
+            commands::archive_usage,
             commands::claude_dirs_status,
             commands::inspect_claude_dir,
             commands::rebuild_db,

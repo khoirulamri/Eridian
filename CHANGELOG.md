@@ -21,8 +21,23 @@ semantic versioning.
   label is derived from the transcript path at read time — no schema change, and
   no re-ingest of your existing archive.
 
+- **Archive size budget.** A new optional Settings field caps the archive in GB.
+  When it is exceeded, the oldest sessions across all accounts are pruned until
+  it fits, then the DB is compacted so the reported size actually drops. Each
+  account always keeps its most recent session, so a budget can never erase one.
+  Off by default. Added because a session count is a poor proxy for disk —
+  measured sessions range from 1 KB to 3.5 MB.
+- **Per-account archive breakdown** in Settings → Database: sessions and size per
+  watched directory, so retention numbers can be chosen from evidence.
+
 ### Changed
 
+- **Retention is now per account, not one shared pool.** `Max sessions per agent`
+  becomes **`Max sessions per account`**: every watched Claude directory keeps its
+  own N most-recent sessions, so a busy account can no longer evict a quiet one's
+  history. An existing `settings.json` keeps its configured value (read through a
+  serde alias) — which now applies per account, so no upgrade deletes anything it
+  previously kept. The default for fresh installs drops from 1000 to 300.
 - **Backfill file limit is now per watched directory, newest first.** Previously
   the cap truncated an arbitrary subset (transcripts were walked in filesystem
   order); it now keeps each directory’s most recently modified transcripts, so a

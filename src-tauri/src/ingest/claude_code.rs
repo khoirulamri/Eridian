@@ -1281,6 +1281,73 @@ mod tests {
         );
     }
 
+    /// Real-data retention check: backfill several real accounts, then apply a
+    /// per-account cap and assert every account keeps exactly N — including the
+    /// small ones a single shared pool would have evicted first.
+    ///
+    /// Ignored by default (depends on the machine's transcripts). Run:
+    ///   ERIDIAN_TEST_CLAUDE_DIRS="~/.claude-a,~/.claude-b" \
+    ///     cargo test -- --ignored real_retention --nocapture
+    #[test]
+    #[ignore]
+    fn real_retention_keeps_every_account() {
+        let Ok(extra) = std::env::var("ERIDIAN_TEST_CLAUDE_DIRS") else {
+            eprintln!("set ERIDIAN_TEST_CLAUDE_DIRS to run this");
+            return;
+        };
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_settings(crate::store::Settings {
+                claude_dirs: extra
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|d| !d.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+                max_sessions_per_account: None,
+                ..Default::default()
+            })
+            .unwrap();
+        backfill(&store, false).unwrap();
+
+        let tally = |store: &Store| {
+            let mut m: std::collections::BTreeMap<String, usize> =
+                std::collections::BTreeMap::new();
+            for s in store.list_sessions(None).unwrap() {
+                *m.entry(s.account.clone().unwrap_or_else(|| "<default>".into()))
+                    .or_default() += 1;
+            }
+            m
+        };
+        let before = tally(&store);
+        eprintln!("before: {before:?}");
+        assert!(before.len() > 1, "need at least two accounts to be meaningful");
+
+        const CAP: usize = 5;
+        store
+            .set_settings(crate::store::Settings {
+                claude_dirs: store
+                    .settings()
+                    .claude_dirs
+                    .clone(),
+                max_sessions_per_account: Some(CAP as i64),
+                ..Default::default()
+            })
+            .unwrap();
+        let after = tally(&store);
+        eprintln!("after cap={CAP}: {after:?}");
+
+        assert_eq!(
+            after.len(),
+            before.len(),
+            "no account may be wiped out by another account's volume"
+        );
+        for (account, n) in &after {
+            let expected = before[account].min(CAP);
+            assert_eq!(n, &expected, "account {account} kept the wrong number");
+        }
+    }
+
     // ── fixture round-trip: normalize → store → query (PLAN.md M1) ────────────
 
     #[test]

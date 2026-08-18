@@ -58,7 +58,9 @@ Rust (`src-tauri/src/`):
   user_version`), `NORMALIZER_VERSION` self-heal, atomic `commit_batches`, all read
   queries (`list_sessions` w/ token totals, `session_events`, `session_changes` [capped
   400 files], `session_subagents`, `search_events`, `usage_by_day`,
-  `reconcile_source_alive`, retention).
+  `reconcile_source_alive`, retention). Retention has two controls — a per-(agent,
+  account) session cap and an optional archive size budget; the policy itself lives
+  in `retention.rs`.
 - `normalize.rs` — the shared event model: `NormalizedSession/Event/Batch`, `EventKind`.
 - `ingest/claude_code.rs` — JSONL backfill + notify watcher + byte-offset tail +
   reconciliation sweep, over **every** configured Claude home (`~/.claude` plus the
@@ -73,6 +75,10 @@ Rust (`src-tauri/src/`):
 - `mcp_config.rs`, `skills_config.rs` — on-disk config readers (secret masking).
   These still read `~/.claude` only — extending them to the extra dirs is a
   separate change; `Store::claude_home_dirs()` is the seam.
+- `retention.rs` — pure retention policy (which sessions to drop) with no I/O, so
+  the decision is exhaustively testable; `store.rs` does the deleting. Size budgets
+  are computed up front from stored bytes, never by delete-and-re-measure — a loop
+  on a live size metric that doesn't move would gut the archive.
 - `paths.rs` — pure path helpers: `expand_home` / `display_home` (never send a raw
   absolute path to the UI — it embeds the OS username) and `account_label`, which
   derives a session's account chip from its transcript path.

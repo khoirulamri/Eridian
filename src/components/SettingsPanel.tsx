@@ -1,6 +1,12 @@
 import { useEffect, useRef, useState } from "react";
 import { api, onIngestProgress } from "../lib/api";
-import type { ClaudeDirInfo, DbInfo, IngestProgress, Settings } from "../lib/types";
+import type {
+  AccountUsage,
+  ClaudeDirInfo,
+  DbInfo,
+  IngestProgress,
+  Settings,
+} from "../lib/types";
 import { ConfirmModal } from "./ConfirmModal";
 import { AboutUpdates } from "./AboutUpdates";
 
@@ -19,7 +25,9 @@ function formatBytes(n: number): string {
 export function SettingsPanel() {
   const [info, setInfo] = useState<DbInfo | null>(null);
   const [fileLimit, setFileLimit] = useState<string>("");
-  const [maxPerAgent, setMaxPerAgent] = useState<string>("");
+  const [maxPerAccount, setMaxPerAccount] = useState<string>("");
+  const [archiveGb, setArchiveGb] = useState<string>("");
+  const [usage, setUsage] = useState<AccountUsage[]>([]);
   const [saved, setSaved] = useState(false);
   const [rebuilding, setRebuilding] = useState(false);
   const [confirmRebuild, setConfirmRebuild] = useState(false);
@@ -39,14 +47,21 @@ export function SettingsPanel() {
 
   const loadInfo = () => api.dbInfo().then(setInfo).catch(() => {});
   const loadDirs = () => api.claudeDirsStatus().then(setDirRows).catch(() => {});
+  // Deliberately NOT folded into loadInfo: dbInfo is refetched ~1/s during a
+  // backfill, while this one scans the events table.
+  const loadUsage = () => api.archiveUsage().then(setUsage).catch(() => {});
   const lastRefetch = useRef(0);
   useEffect(() => {
     loadInfo();
     loadDirs();
+    loadUsage();
     api.getSettings().then((s) => {
       setCatalogFetch(s.catalogFetchEnabled);
       setFileLimit(s.backfillFileLimit != null ? String(s.backfillFileLimit) : "");
-      setMaxPerAgent(s.maxSessionsPerAgent != null ? String(s.maxSessionsPerAgent) : "");
+      setMaxPerAccount(
+        s.maxSessionsPerAccount != null ? String(s.maxSessionsPerAccount) : ""
+      );
+      setArchiveGb(s.maxArchiveMb != null ? String(s.maxArchiveMb / 1024) : "");
       setClaudeDirs(s.claudeDirs);
       setSettingsLoaded(true);
     });
@@ -63,6 +78,7 @@ export function SettingsPanel() {
         lastRefetch.current = Date.now();
         loadInfo();
         loadDirs();
+        loadUsage();
         setRebuilding(false);
       } else if (Date.now() - lastRefetch.current >= 1000) {
         lastRefetch.current = Date.now();
@@ -83,18 +99,31 @@ export function SettingsPanel() {
     const n = parseInt(v, 10);
     return Number.isFinite(n) && n > 0 ? n : null;
   };
+  // The size budget is entered in GB (decimals allowed) but stored in MB, so a
+  // fractional value like 0.5 survives the round-trip.
+  const parseGbToMb = (v: string): number | null => {
+    const n = parseFloat(v);
+    return Number.isFinite(n) && n > 0 ? Math.round(n * 1024) : null;
+  };
+
+  // One builder for all three save paths (form Save, the network toggle, the
+  // directory list). They each used to construct Settings literally, so a new
+  // field missed in one of them was silently clobbered by whichever fired first.
+  const currentSettings = (over: Partial<Settings> = {}): Settings => ({
+    backfillFileLimit: parse(fileLimit),
+    maxSessionsPerAccount: parse(maxPerAccount),
+    catalogFetchEnabled: catalogFetch,
+    claudeDirs,
+    maxArchiveMb: parseGbToMb(archiveGb),
+    ...over,
+  });
 
   const save = async () => {
-    const next: Settings = {
-      backfillFileLimit: parse(fileLimit),
-      maxSessionsPerAgent: parse(maxPerAgent),
-      catalogFetchEnabled: catalogFetch,
-      claudeDirs,
-    };
-    await api.setSettings(next);
+    await api.setSettings(currentSettings());
     setSaved(true);
     setTimeout(() => setSaved(false), 2000);
     loadInfo();
+    loadUsage();
   };
 
   // Persist the network toggle immediately — it's a switch, not a form field, so
@@ -103,12 +132,7 @@ export function SettingsPanel() {
   const persistCatalogToggle = async (enabled: boolean) => {
     setCatalogFetch(enabled);
     try {
-      await api.setSettings({
-        backfillFileLimit: parse(fileLimit),
-        maxSessionsPerAgent: parse(maxPerAgent),
-        catalogFetchEnabled: enabled,
-        claudeDirs,
-      });
+      await api.setSettings(currentSettings({ catalogFetchEnabled: enabled }));
       if (enabled) await refreshCatalogs();
     } catch {
       /* revert the visual state if the save failed */
@@ -122,12 +146,7 @@ export function SettingsPanel() {
   const persistDirs = async (dirs: string[]) => {
     setDirBusy(true);
     try {
-      const saved = await api.setSettings({
-        backfillFileLimit: parse(fileLimit),
-        maxSessionsPerAgent: parse(maxPerAgent),
-        catalogFetchEnabled: catalogFetch,
-        claudeDirs: dirs,
-      });
+      const saved = await api.setSettings(currentSettings({ claudeDirs: dirs }));
       setClaudeDirs(saved.claudeDirs);
       await loadDirs();
       return true;
@@ -230,6 +249,37 @@ export function SettingsPanel() {
             <dd className="num">{info ? info.events.toLocaleString() : "…"}</dd>
           </div>
         </dl>
+        {usage.length > 0 && (
+          <ul className="usage-list">
+            {usage.map((u) => (
+              <li key={`${u.agent}:${u.account ?? ""}`} className="usage-row">
+                {u.account ? (
+                  <span className="tag account">{u.account}</span>
+                ) : (
+                  <span className="tag">
+                    {u.agent === "opencode" ? "opencode" : "default"}
+                  </span>
+                )}
+                <span
+                  className="usage-bar"
+                  aria-hidden
+                  style={{
+                    // Share of the largest account — usage is sorted desc, so
+                    // usage[0] is the max and the divisor is never 0 here.
+                    ["--w" as string]: `${Math.max(
+                      2,
+                      Math.round((u.bytes / usage[0].bytes) * 100)
+                    )}%`,
+                  }}
+                />
+                <span className="muted num usage-n">
+                  {u.sessions.toLocaleString()} sessions
+                </span>
+                <span className="num usage-b">{formatBytes(u.bytes)}</span>
+              </li>
+            ))}
+          </ul>
+        )}
         <div className="settings-actions">
           <button
             className="settings-btn danger"
@@ -360,18 +410,41 @@ export function SettingsPanel() {
           </span>
         </label>
         <label className="settings-field">
-          <span className="settings-label">Max sessions per agent</span>
+          <span className="settings-label">Max sessions per account</span>
           <input
             type="number"
             min={1}
-            value={maxPerAgent}
-            onChange={(e) => setMaxPerAgent(e.target.value)}
+            value={maxPerAccount}
+            onChange={(e) => setMaxPerAccount(e.target.value)}
             placeholder="keep all"
           />
           <span className="muted settings-hint">
-            Retention: keep only the N most-recent sessions per agent; older ones
-            are pruned (blank = keep all). The cap is shared across all watched
-            directories, so raise it if you added several accounts.
+            Retention: every watched directory keeps its own N most-recent
+            sessions, so a busy account can’t evict a quiet one (blank = keep
+            all).{" "}
+            {parse(maxPerAccount) != null && usage.length > 1
+              ? `${usage.length} accounts → up to ${(
+                  parse(maxPerAccount)! * usage.length
+                ).toLocaleString()} sessions.`
+              : ""}
+          </span>
+        </label>
+        <label className="settings-field">
+          <span className="settings-label">Archive size budget (GB)</span>
+          <input
+            type="number"
+            min={0.1}
+            step={0.5}
+            value={archiveGb}
+            onChange={(e) => setArchiveGb(e.target.value)}
+            placeholder="no limit"
+          />
+          <span className="muted settings-hint">
+            Backstop: when the archive exceeds this, the oldest sessions across
+            all accounts are pruned until it fits — a session count is a poor
+            proxy for disk, since sessions differ hugely in size. Each account
+            always keeps its newest session. Blank = no limit.{" "}
+            {info ? `Now ${formatBytes(info.sizeBytes)}.` : ""}
           </span>
         </label>
         <div className="settings-actions">

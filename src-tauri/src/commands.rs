@@ -683,6 +683,28 @@ pub fn set_settings(
     store.set_settings(settings).map_err(err)
 }
 
+/// Archive footprint of one (agent, account) bucket, for the Settings page.
+/// `bytes` is an on-disk estimate (stored content scaled by the measured index
+/// overhead), so it is comparable with the Database card's "Size on disk".
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountUsage {
+    pub agent: String,
+    /// `None` for the default `~/.claude` root and for OpenCode.
+    pub account: Option<String>,
+    pub sessions: i64,
+    pub events: i64,
+    pub bytes: i64,
+}
+
+/// Per-account archive breakdown. Kept OUT of `db_info` on purpose: that one is
+/// refetched ~1/s while a backfill runs and must stay cheap, while this scans
+/// the events table and is only read when the Settings page needs it.
+#[tauri::command(async)]
+pub fn archive_usage(store: State<crate::store::Store>) -> Result<Vec<AccountUsage>, String> {
+    store.archive_usage().map_err(err)
+}
+
 /// One watchable Claude Code home directory, for the Settings list.
 ///
 /// `path` is the display form (`~/.claude-work`) — the absolute path is never

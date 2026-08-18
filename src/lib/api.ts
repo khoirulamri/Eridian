@@ -8,6 +8,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ActivityBucket,
   SkillRun,
+  AccountUsage,
   AppendedPayload,
   ClaudeDirInfo,
   DbInfo,
@@ -102,6 +103,7 @@ export const api = {
     invoke<FileContent>("file_at_commit", { path, sha }),
 
   dbInfo: () => invoke<DbInfo>("db_info"),
+  archiveUsage: () => invoke<AccountUsage[]>("archive_usage"),
   getSettings: () => invoke<Settings>("get_settings"),
   setSettings: (settings: Settings) => invoke<Settings>("set_settings", { settings }),
   claudeDirsStatus: () => invoke<ClaudeDirInfo[]>("claude_dirs_status"),

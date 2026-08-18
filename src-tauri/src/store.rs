@@ -35,6 +35,14 @@ const RUNNING_WINDOW_SECS: i64 = 300;
 const HISTORY_MAX: i64 = 400;
 /// Command output is size-capped on read (never bulk-load a huge stdout).
 const OUTPUT_CAP: usize = 20_000;
+/// On-disk bytes per byte of stored `raw_json`: FTS5 index + the events/sessions
+/// indexes roughly this much again on top of the content. Measured on a real
+/// archive (90 MB raw_json → 156 MB file). Used to translate the user's MB
+/// budget into the raw-json space retention actually measures.
+const ARCHIVE_OVERHEAD: f64 = 1.75;
+/// A budget below this is treated as unset rather than pruning to the floor —
+/// mirrors the 0-means-off idiom in `backfill_file_limit`.
+const MIN_ARCHIVE_BUDGET_MB: i64 = 64;
 
 /// Cloneable handle to the single connection. Cheap to clone (Arc inside).
 #[derive(Clone)]
@@ -82,14 +90,22 @@ pub struct IngestProgress {
 pub struct Settings {
     /// Max transcript files to backfill (None = all).
     pub backfill_file_limit: Option<i64>,
-    /// Retention: keep only the N most-recent sessions per agent (None = keep all).
-    pub max_sessions_per_agent: Option<i64>,
+    /// Retention: keep only the N most-recent sessions per (agent, account)
+    /// (None = keep all). The `alias` migrates an existing settings.json written
+    /// when this was a single pool shared by every Claude account; the value is
+    /// preserved and rewritten under the new name on the next save.
+    #[serde(alias = "maxSessionsPerAgent")]
+    pub max_sessions_per_account: Option<i64>,
     /// Opt-in: allow read-only GET fetches to the catalog allowlist (default off).
     pub catalog_fetch_enabled: bool,
     /// Extra Claude Code home directories to ingest, on top of the implicit
     /// `~/.claude` (multi-account: each `CLAUDE_CONFIG_DIR` has its own
     /// `projects/` tree). Stored absolute; see [`Store::claude_home_dirs`].
     pub claude_dirs: Vec<String>,
+    /// Global archive size budget in MB (None = no cap). A backstop on top of
+    /// the per-account cap: a session count is a poor proxy for disk, since
+    /// sessions differ in size by orders of magnitude.
+    pub max_archive_mb: Option<i64>,
 }
 
 impl Default for Settings {
@@ -98,9 +114,14 @@ impl Default for Settings {
         // while comfortably covering typical local histories.
         Self {
             backfill_file_limit: Some(2000),
-            max_sessions_per_agent: Some(1000),
+            // Per ACCOUNT, so this is deliberately lower than the 1000 it was
+            // when one pool served every Claude directory. An existing
+            // settings.json keeps its own value via the serde alias — that's a
+            // loosening, so no upgrade deletes anything it previously kept.
+            max_sessions_per_account: Some(300),
             catalog_fetch_enabled: false,
             claude_dirs: Vec::new(),
+            max_archive_mb: None,
         }
     }
 }
@@ -1286,40 +1307,140 @@ impl Store {
         })
     }
 
-    /// Retention: keep only the N most-recent sessions per agent (deleting the
-    /// rest and their events). No-op if unset. Pruned sessions stay pruned until
-    /// their source file grows (offsets aren't reset), which is the desired
-    /// behavior.
+    /// Retention. Two independent controls, both optional:
+    ///
+    ///   1. **Per-account cap** — each (agent, account) bucket keeps its N most
+    ///      recent sessions, so a busy Claude account can't evict a quiet one's
+    ///      history. The account is derived from `source_ref`, not stored, so
+    ///      this needs no schema change (see [`crate::paths::account_label`]).
+    ///   2. **Size budget** — a global backstop that drops the oldest sessions
+    ///      across all accounts until the archive fits.
+    ///
+    /// Pruned sessions stay pruned until their source file grows (offsets aren't
+    /// reset), which is the desired behavior. Returns the number pruned.
     pub fn enforce_retention(&self) -> Result<usize> {
-        let Some(max) = self.inner.settings.lock().unwrap().max_sessions_per_agent else {
-            return Ok(0);
+        self.enforce_retention_inner(MIN_ARCHIVE_BUDGET_MB)
+    }
+
+    /// Test seam: `min_budget_mb` is the floor below which a size budget is
+    /// ignored. Production always passes [`MIN_ARCHIVE_BUDGET_MB`]; tests lower
+    /// it so the pruning path can be exercised without building a 40 MB fixture.
+    fn enforce_retention_inner(&self, min_budget_mb: i64) -> Result<usize> {
+        let (max_per_account, budget_mb) = {
+            let s = self.inner.settings.lock().unwrap();
+            (s.max_sessions_per_account, s.max_archive_mb)
         };
-        if max <= 0 {
+
+        // Cheap early-out: read the session table (~1k rows) once. Ranking moves
+        // to Rust because `account` is derived, not a column.
+        let rows = self.retention_candidates()?;
+        if rows.is_empty() {
             return Ok(0);
         }
 
-        // Cheap early-out: window over sessions only (~1k rows). Nothing over the
-        // cap → return without touching the (large) events table.
-        let ids: Vec<String> = {
+        // Phase A — per-account cap. Exact count arithmetic, no estimation, so
+        // it is NOT subject to the per-pass ceiling below.
+        let mut pruned = 0usize;
+        if let Some(max) = max_per_account.filter(|n| *n > 0) {
+            let victims = crate::retention::over_account_cap(&rows, max);
+            pruned += self.delete_sessions(&victims)?;
+        }
+
+        // Phase B — size budget.
+        let mut freed_any = false;
+        if let Some(budget_mb) = budget_mb.filter(|n| *n >= min_budget_mb) {
+            let rows = if pruned > 0 {
+                self.retention_candidates()?
+            } else {
+                rows
+            };
+            let bytes_by_id = self.session_content_bytes()?;
+            let total: i64 = bytes_by_id.values().sum();
+            // Compare in raw-json space: the budget the user set is on-disk MB,
+            // which includes FTS + index overhead (see ARCHIVE_OVERHEAD).
+            let budget_raw =
+                ((budget_mb as f64 * 1_048_576.0) / ARCHIVE_OVERHEAD).round() as i64;
+            let ceiling = (rows.len() / 4).max(1); // ≤25% of sessions per pass
+            let victims = crate::retention::select_for_budget(
+                &crate::retention::eviction_order(&rows),
+                &bytes_by_id,
+                total,
+                budget_raw,
+                ceiling,
+            );
+            if !victims.is_empty() {
+                let n = self.delete_sessions(&victims)?;
+                pruned += n;
+                freed_any = n > 0;
+                let after = total - victims.iter().filter_map(|v| bytes_by_id.get(v)).sum::<i64>();
+                if after > budget_raw {
+                    tracing::warn!(
+                        budget_mb,
+                        pruned = n,
+                        "archive still over budget after this pass (per-pass ceiling \
+                         or the per-account floor); the next sweep continues"
+                    );
+                }
+            }
+        }
+
+        // Only a size-driven prune reclaims disk: DELETE alone leaves free pages
+        // and db_info() reports FILE size, so the Settings card would show no
+        // change. VACUUM in WAL mode writes the whole DB through the WAL, hence
+        // the checkpoint — without it the reported size can briefly go UP.
+        // Guarded on freed_any: enforce_retention runs on every 30s sweep.
+        if freed_any {
             let conn = self.lock();
-            let mut stmt = conn.prepare(
-                "SELECT id FROM (
-                   SELECT id, ROW_NUMBER() OVER (PARTITION BY agent ORDER BY updated_at DESC) rn
-                   FROM sessions
-                 ) WHERE rn > ?1",
-            )?;
-            let rows = stmt.query_map(params![max], |r| r.get::<_, String>(0))?;
-            rows.collect::<rusqlite::Result<Vec<String>>>()?
-        };
-        if ids.is_empty() {
-            return Ok(0);
+            conn.execute("VACUUM", [])?;
+            let _ = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()));
         }
+        if pruned > 0 {
+            tracing::info!(pruned, max_per_account = ?max_per_account, "retention prune");
+        }
+        Ok(pruned)
+    }
 
-        // Delete each pruned session's events in bounded chunks, committing per
-        // chunk and RELEASING the connection lock between chunks. A single big
-        // session (tens of thousands of events × FTS delete triggers) would
-        // otherwise hold the lock for seconds and freeze every UI read.
-        for id in &ids {
+    /// Every session as retention sees it (id, agent, derived account, updated_at).
+    fn retention_candidates(&self) -> Result<Vec<crate::retention::Candidate>> {
+        let conn = self.lock();
+        let mut stmt =
+            conn.prepare("SELECT id, agent, source_ref, updated_at FROM sessions")?;
+        let rows = stmt.query_map([], |r| {
+            let source_ref: Option<String> = r.get(2)?;
+            Ok(crate::retention::Candidate {
+                id: r.get(0)?,
+                agent: r.get(1)?,
+                account: source_ref.as_deref().and_then(crate::paths::account_label),
+                updated_at: r.get(3)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Stored `raw_json` bytes per session — the size signal for the budget and
+    /// for the Settings breakdown. One pass over events.
+    fn session_content_bytes(&self) -> Result<std::collections::HashMap<String, i64>> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT session_id, SUM(LENGTH(raw_json)) FROM events GROUP BY session_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0)))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Delete sessions and their events, events first.
+    ///
+    /// `events.session_id` REFERENCES `sessions(id)` with **no ON DELETE
+    /// CASCADE** and `foreign_keys` is ON, so dropping the session row first
+    /// would raise a FK error — the ordering is correctness, not just tidiness.
+    /// Events go in bounded chunks, committing per chunk and RELEASING the
+    /// connection lock between them: a single big session (tens of thousands of
+    /// events × FTS delete triggers) would otherwise hold the lock for seconds
+    /// and freeze every UI read.
+    fn delete_sessions(&self, ids: &[String]) -> Result<usize> {
+        for id in ids {
             loop {
                 let mut conn = self.lock();
                 let tx = conn.transaction()?;
@@ -1337,8 +1458,45 @@ impl Store {
             let conn = self.lock();
             conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         }
-        tracing::info!(pruned = ids.len(), max, "retention prune");
         Ok(ids.len())
+    }
+
+    /// Per-account archive breakdown for the Settings page.
+    pub fn archive_usage(&self) -> Result<Vec<crate::commands::AccountUsage>> {
+        let rows = self.retention_candidates()?;
+        let bytes = self.session_content_bytes()?;
+        let counts: std::collections::HashMap<String, i64> = {
+            let conn = self.lock();
+            let mut stmt =
+                conn.prepare("SELECT session_id, COUNT(*) FROM events GROUP BY session_id")?;
+            let r = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            r.collect::<rusqlite::Result<_>>()?
+        };
+
+        let mut by: std::collections::HashMap<(String, Option<String>), (i64, i64, i64)> =
+            std::collections::HashMap::new();
+        for c in &rows {
+            let e = by.entry((c.agent.clone(), c.account.clone())).or_default();
+            e.0 += 1;
+            e.1 += counts.get(&c.id).copied().unwrap_or(0);
+            e.2 += bytes.get(&c.id).copied().unwrap_or(0);
+        }
+        let mut out: Vec<crate::commands::AccountUsage> = by
+            .into_iter()
+            .map(
+                |((agent, account), (sessions, events, b))| crate::commands::AccountUsage {
+                    agent,
+                    account,
+                    sessions,
+                    events,
+                    // Report the on-disk share, matching the units of the budget
+                    // and of the Database card's "Size on disk".
+                    bytes: (b as f64 * ARCHIVE_OVERHEAD).round() as i64,
+                },
+            )
+            .collect();
+        out.sort_by(|a, b| b.bytes.cmp(&a.bytes).then_with(|| a.agent.cmp(&b.agent)));
+        Ok(out)
     }
 
     /// Reconcile the archive flag: flip `source_alive` to 0 for claude-code
@@ -2389,10 +2547,235 @@ mod tests {
         assert_eq!(days[1].tokens_out, 3);
     }
 
+    /// A session that lives under a specific fake Claude home, so
+    /// `paths::account_label` derives the account we want to test.
+    fn acct_session(id: &str, account: &str, updated: &str) -> NormalizedSession {
+        let mut s = session(id);
+        s.source_ref = Some(format!("/h/.claude-{account}/projects/p/{id}.jsonl"));
+        s.updated_at = Some(updated.to_string());
+        s
+    }
+
+    #[test]
+    fn cap_is_per_account_so_a_busy_account_cannot_evict_a_quiet_one() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .set_settings(Settings { max_sessions_per_account: Some(2), ..Settings::default() })
+            .unwrap();
+
+        // 4 recent sessions in one account, 1 much older session in another.
+        // Under the OLD global cap the quiet account's session — the oldest of
+        // all — would be the first thing evicted.
+        let mut batches: Vec<NormalizedBatch> = (0..4)
+            .map(|i| NormalizedBatch {
+                session: Some(acct_session(
+                    &format!("cc:busy{i}"),
+                    "busy",
+                    &format!("2026-08-0{}T00:00:00Z", i + 1),
+                )),
+                events: vec![],
+            })
+            .collect();
+        batches.push(NormalizedBatch {
+            session: Some(acct_session("cc:quiet0", "quiet", "2026-01-01T00:00:00Z")),
+            events: vec![],
+        });
+        store.commit_batches("/f", 1, batches).unwrap();
+
+        assert_eq!(store.enforce_retention().unwrap(), 2, "only busy is over its cap");
+        let ids: Vec<String> = store.list_sessions(None).unwrap().into_iter().map(|s| s.id).collect();
+        assert!(ids.contains(&"cc:quiet0".to_string()), "the quiet account survives");
+        assert!(ids.contains(&"cc:busy3".to_string()));
+        assert!(ids.contains(&"cc:busy2".to_string()));
+        assert!(!ids.contains(&"cc:busy0".to_string()));
+    }
+
+    #[test]
+    fn size_budget_prunes_oldest_across_accounts_but_never_empties_one() {
+        let store = Store::open_in_memory().unwrap();
+        // ~600 KB of raw_json per session so a 1 MB budget genuinely bites.
+        let big = "x".repeat(600_000);
+        let mut batches = Vec::new();
+        for (i, (id, acct, ts)) in [
+            ("cc:a-old", "alpha", "2026-01-01T00:00:00Z"),
+            ("cc:a-new", "alpha", "2026-08-09T00:00:00Z"),
+            ("cc:b-old", "beta", "2026-02-01T00:00:00Z"),
+            ("cc:b-new", "beta", "2026-08-08T00:00:00Z"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut e = ev(id, EventKind::Assistant, Some(&format!("u{i}")), Some("t"));
+            e.raw_json = big.clone();
+            batches.push(NormalizedBatch {
+                session: Some(acct_session(id, acct, ts)),
+                events: vec![e],
+            });
+        }
+        store.commit_batches("/f", 1, batches).unwrap();
+        assert_eq!(store.list_sessions(None).unwrap().len(), 4);
+
+        // No count cap — the budget alone must do the work. 2.4 MB of content
+        // against a 1 MB budget, so at least one session has to go.
+        store
+            .set_settings(Settings {
+                max_sessions_per_account: None,
+                max_archive_mb: Some(1),
+                ..Settings::default()
+            })
+            .unwrap();
+        let pruned = store.enforce_retention_inner(1).unwrap();
+        assert!(pruned > 0, "a budget well under the content must prune");
+
+        let ids: Vec<String> =
+            store.list_sessions(None).unwrap().into_iter().map(|s| s.id).collect();
+        assert!(
+            ids.contains(&"cc:a-new".to_string()) && ids.contains(&"cc:b-new".to_string()),
+            "each account keeps its newest session however tight the budget: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"cc:a-old".to_string()),
+            "the globally-oldest session goes first: {ids:?}"
+        );
+    }
+
+    #[test]
+    fn a_size_prune_reclaims_free_pages_but_a_no_op_pass_does_not_vacuum() {
+        let store = Store::open_in_memory().unwrap();
+        let big = "x".repeat(600_000);
+        let mut batches = Vec::new();
+        for (i, (id, acct, ts)) in [
+            ("cc:a-old", "alpha", "2026-01-01T00:00:00Z"),
+            ("cc:a-new", "alpha", "2026-08-09T00:00:00Z"),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut e = ev(id, EventKind::Assistant, Some(&format!("u{i}")), Some("t"));
+            e.raw_json = big.clone();
+            batches.push(NormalizedBatch {
+                session: Some(acct_session(id, acct, ts)),
+                events: vec![e],
+            });
+        }
+        store.commit_batches("/f", 1, batches).unwrap();
+
+        store
+            .set_settings(Settings {
+                max_sessions_per_account: None,
+                max_archive_mb: Some(1),
+                ..Settings::default()
+            })
+            .unwrap();
+        assert!(store.enforce_retention_inner(1).unwrap() > 0);
+        let free: i64 = store
+            .lock()
+            .query_row("PRAGMA freelist_count", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(free, 0, "a size-driven prune VACUUMs so the file actually shrinks");
+
+        // Second pass has nothing to do → no prune, and no VACUUM churn on what
+        // is a 30-second sweep in production.
+        assert_eq!(store.enforce_retention_inner(1).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_budget_below_the_minimum_is_treated_as_unset() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .commit_batches(
+                "/f",
+                1,
+                vec![NormalizedBatch { session: Some(session("cc:s1")), events: vec![] }],
+            )
+            .unwrap();
+        store
+            .set_settings(Settings {
+                max_sessions_per_account: None,
+                max_archive_mb: Some(1), // absurd; must not prune to the floor
+                ..Settings::default()
+            })
+            .unwrap();
+        assert_eq!(store.enforce_retention().unwrap(), 0);
+        assert_eq!(store.list_sessions(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn retention_with_both_controls_unset_is_a_no_op() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .commit_batches(
+                "/f",
+                1,
+                vec![NormalizedBatch { session: Some(session("cc:s1")), events: vec![] }],
+            )
+            .unwrap();
+        store
+            .set_settings(Settings {
+                max_sessions_per_account: None,
+                max_archive_mb: None,
+                ..Settings::default()
+            })
+            .unwrap();
+        assert_eq!(store.enforce_retention().unwrap(), 0);
+        assert_eq!(store.list_sessions(None).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn archive_usage_splits_by_account_and_reports_size() {
+        let store = Store::open_in_memory().unwrap();
+        let mut e1 = ev("cc:a1", EventKind::Assistant, Some("u1"), Some("t"));
+        e1.raw_json = "y".repeat(1000);
+        let mut e2 = ev("cc:b1", EventKind::Assistant, Some("u2"), Some("t"));
+        e2.raw_json = "y".repeat(100);
+        store
+            .commit_batches(
+                "/f",
+                1,
+                vec![
+                    NormalizedBatch {
+                        session: Some(acct_session("cc:a1", "alpha", "2026-08-01T00:00:00Z")),
+                        events: vec![e1],
+                    },
+                    NormalizedBatch {
+                        session: Some(acct_session("cc:b1", "beta", "2026-08-02T00:00:00Z")),
+                        events: vec![e2],
+                    },
+                ],
+            )
+            .unwrap();
+
+        let usage = store.archive_usage().unwrap();
+        assert_eq!(usage.len(), 2);
+        // Sorted biggest-first so the Settings card leads with the space hog.
+        assert_eq!(usage[0].account.as_deref(), Some("alpha"));
+        assert_eq!(usage[0].sessions, 1);
+        assert_eq!(usage[0].events, 1);
+        assert!(usage[0].bytes > usage[1].bytes);
+        assert!(usage[0].bytes >= 1000, "on-disk estimate includes index overhead");
+    }
+
+    #[test]
+    fn settings_written_when_the_cap_was_per_agent_keep_their_value() {
+        // Not a vacuous parse test: the container-level #[serde(default)] would
+        // silently ignore an unknown key, so this asserts the VALUE survives the
+        // rename via the serde alias.
+        let old: Settings = serde_json::from_str(
+            r#"{"backfillFileLimit":10,"maxSessionsPerAgent":777,"catalogFetchEnabled":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            old.max_sessions_per_account,
+            Some(777),
+            "an existing settings.json must not silently reset to the new default"
+        );
+        assert_eq!(old.max_archive_mb, None, "the size budget defaults to off");
+    }
+
     #[test]
     fn retention_early_out_when_under_cap() {
         let store = Store::open_in_memory().unwrap();
-        store.set_settings(Settings { backfill_file_limit: None, max_sessions_per_agent: Some(10), catalog_fetch_enabled: false , ..Settings::default() }).unwrap();
+        store.set_settings(Settings { backfill_file_limit: None, max_sessions_per_account: Some(10), catalog_fetch_enabled: false , ..Settings::default() }).unwrap();
         store
             .commit_batches("/f", 1, vec![NormalizedBatch { session: Some(session("cc:s1")), events: vec![] }])
             .unwrap();
@@ -2404,7 +2787,7 @@ mod tests {
     fn retention_prunes_oldest_and_all_its_events_chunked() {
         let store = Store::open_in_memory().unwrap();
         // keep only 1 per agent
-        store.set_settings(Settings { backfill_file_limit: None, max_sessions_per_agent: Some(1), catalog_fetch_enabled: false , ..Settings::default() }).unwrap();
+        store.set_settings(Settings { backfill_file_limit: None, max_sessions_per_account: Some(1), catalog_fetch_enabled: false , ..Settings::default() }).unwrap();
 
         let mut old = session("cc:old");
         old.updated_at = Some("2026-08-01T00:00:00Z".to_string());
@@ -2567,14 +2950,14 @@ mod tests {
     fn settings_roundtrip_and_backfill_limit() {
         let store = Store::open_in_memory().unwrap();
         let s = store
-            .set_settings(Settings { backfill_file_limit: Some(50), max_sessions_per_agent: None, catalog_fetch_enabled: false , ..Settings::default() })
+            .set_settings(Settings { backfill_file_limit: Some(50), max_sessions_per_account: None, catalog_fetch_enabled: false , ..Settings::default() })
             .unwrap();
         assert_eq!(s.backfill_file_limit, Some(50));
         assert_eq!(store.settings().backfill_file_limit, Some(50));
         assert_eq!(store.backfill_file_limit(), Some(50));
         // 0 / negative → treated as "no limit"
         store
-            .set_settings(Settings { backfill_file_limit: Some(0), max_sessions_per_agent: Some(0), catalog_fetch_enabled: false , ..Settings::default() })
+            .set_settings(Settings { backfill_file_limit: Some(0), max_sessions_per_account: Some(0), catalog_fetch_enabled: false , ..Settings::default() })
             .unwrap();
         assert_eq!(store.backfill_file_limit(), None);
     }

@@ -245,10 +245,24 @@ export interface SkillRow {
 
 export interface Settings {
   backfillFileLimit: number | null;
-  maxSessionsPerAgent: number | null;
+  /** Retention: N most-recent sessions kept per (agent, account). */
+  maxSessionsPerAccount: number | null;
   catalogFetchEnabled: boolean;
   /** Extra Claude Code home directories to ingest, on top of `~/.claude`. */
   claudeDirs: string[];
+  /** Global archive size budget in MB (null = no cap). */
+  maxArchiveMb: number | null;
+}
+
+/** Archive footprint of one account, for the Settings Database card. */
+export interface AccountUsage {
+  agent: Agent;
+  /** Null for the default `~/.claude` root and for OpenCode. */
+  account: string | null;
+  sessions: number;
+  events: number;
+  /** On-disk estimate, comparable with DbInfo.sizeBytes. */
+  bytes: number;
 }
 
 /** One watchable Claude Code home directory (Settings → Watched directories). */
