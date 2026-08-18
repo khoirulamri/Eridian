@@ -4,6 +4,30 @@ All notable changes to Eridian are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 semantic versioning.
 
+## [Unreleased]
+
+### Added
+
+- **Multiple Claude Code directories (multi-account).** Settings gains a
+  **Watched directories** card: add another Claude home directory — the one a
+  second account’s `CLAUDE_CONFIG_DIR` points at — and Eridian backfills and
+  live-watches its `projects/` tree alongside `~/.claude`. Sibling `~/.claude*` directories are
+  detected automatically and offered with a one-click **Add**, so no folder-picker
+  dependency is needed. Adding or removing a directory applies immediately, with
+  no restart.
+- **Account chip on sessions.** Sessions ingested from an extra directory carry a
+  short label derived from its name (`~/.claude-work` → `work`), shown in the
+  session list and the timeline header so a merged archive stays legible. The
+  label is derived from the transcript path at read time — no schema change, and
+  no re-ingest of your existing archive.
+
+### Changed
+
+- **Backfill file limit is now per watched directory, newest first.** Previously
+  the cap truncated an arbitrary subset (transcripts were walked in filesystem
+  order); it now keeps each directory’s most recently modified transcripts, so a
+  busy account can’t starve the others.
+
 ## [0.3.5] — 2026-08-13
 
 ### Fixed

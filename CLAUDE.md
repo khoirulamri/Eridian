@@ -61,13 +61,21 @@ Rust (`src-tauri/src/`):
   `reconcile_source_alive`, retention).
 - `normalize.rs` — the shared event model: `NormalizedSession/Event/Batch`, `EventKind`.
 - `ingest/claude_code.rs` — JSONL backfill + notify watcher + byte-offset tail +
-  reconciliation sweep; tolerant line normalizer; real subagent parent links via a
-  sidechain's `sessionId`; `usage()` sums input+cache_read+cache_creation tokens.
+  reconciliation sweep, over **every** configured Claude home (`~/.claude` plus the
+  extra dirs in Settings → Watched directories; one watcher, N watched roots,
+  re-synced when `Store::settings_gen()` changes so add/remove needs no restart);
+  tolerant line normalizer; real subagent parent links via a sidechain's
+  `sessionId`; `usage()` sums input+cache_read+cache_creation tokens.
 - `ingest/opencode.rs` — REST bootstrap (per-project `/session?directory=`) + SSE +
   poll; `normalize_session_obj/normalize_message_obj/normalize_part` (reused by cold).
 - `ingest/opencode_cold.rs` — read-only import from `opencode.db` (server-down history).
 - `inspect.rs` — pure risk classify + file-change/diff extraction (heavily tested).
 - `mcp_config.rs`, `skills_config.rs` — on-disk config readers (secret masking).
+  These still read `~/.claude` only — extending them to the extra dirs is a
+  separate change; `Store::claude_home_dirs()` is the seam.
+- `paths.rs` — pure path helpers: `expand_home` / `display_home` (never send a raw
+  absolute path to the UI — it embeds the OS username) and `account_label`, which
+  derives a session's account chip from its transcript path.
 - `commands.rs` — Tauri command surface + DTOs (serde camelCase). `lib.rs` — setup,
   ingest threads, invoke handler, managed opencode child lifecycle.
 
@@ -82,7 +90,7 @@ ProfileMenu, SearchResults). No state library.
   `src-tauri/fixtures/` (scrubbed real sessions). When CC/OpenCode change shape, add a
   fixture, then fix.
 - **Changing normalizer output → bump `NORMALIZER_VERSION`** (`store.rs`). On next
-  launch the store drops its derived cache and re-ingests. It's currently `4`.
+  launch the store drops its derived cache and re-ingests. It's currently `7`.
 - **Rules of Hooks:** put every `useState/useEffect/useRef/useMemo` **above** any early
   `return` in a component — TypeScript won't catch a conditional hook; it blanks the UI.
 - All timestamps stored ISO-8601 UTC. Single writer; all writes in transactions;

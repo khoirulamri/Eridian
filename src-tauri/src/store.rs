@@ -51,6 +51,10 @@ struct Inner {
     db_path: Option<std::path::PathBuf>,
     settings: Mutex<Settings>,
     settings_path: Option<std::path::PathBuf>,
+    /// Bumped on every `set_settings`. The ingest loop polls this (one relaxed
+    /// atomic load per tick) so a directory added in Settings starts being
+    /// watched without an app restart.
+    settings_gen: std::sync::atomic::AtomicU64,
 }
 
 /// Payload for the `eridian://events-appended` live event (mirrors api.ts).
@@ -82,6 +86,10 @@ pub struct Settings {
     pub max_sessions_per_agent: Option<i64>,
     /// Opt-in: allow read-only GET fetches to the catalog allowlist (default off).
     pub catalog_fetch_enabled: bool,
+    /// Extra Claude Code home directories to ingest, on top of the implicit
+    /// `~/.claude` (multi-account: each `CLAUDE_CONFIG_DIR` has its own
+    /// `projects/` tree). Stored absolute; see [`Store::claude_home_dirs`].
+    pub claude_dirs: Vec<String>,
 }
 
 impl Default for Settings {
@@ -92,6 +100,7 @@ impl Default for Settings {
             backfill_file_limit: Some(2000),
             max_sessions_per_agent: Some(1000),
             catalog_fetch_enabled: false,
+            claude_dirs: Vec::new(),
         }
     }
 }
@@ -133,6 +142,7 @@ impl Store {
                 db_path: Some(path.to_path_buf()),
                 settings: Mutex::new(settings),
                 settings_path,
+                settings_gen: std::sync::atomic::AtomicU64::new(0),
             }),
         };
         store.migrate()?;
@@ -157,6 +167,7 @@ impl Store {
                 db_path: None,
                 settings: Mutex::new(Settings::default()),
                 settings_path: None,
+                settings_gen: std::sync::atomic::AtomicU64::new(0),
             }),
         };
         store.migrate()?;
@@ -366,7 +377,7 @@ impl Store {
         let mut sql = String::from(
             "SELECT s.id, s.agent, s.project_path, s.title, s.model, s.git_branch,
                     s.started_at, s.updated_at, s.is_subagent, s.parent_session_id,
-                    s.source_alive,
+                    s.source_alive, s.source_ref,
                     COALESCE(ec.c, 0) AS event_count,
                     COALESCE(ec.ti, 0) AS tokens_in,
                     COALESCE(ec.toko, 0) AS tokens_out,
@@ -420,11 +431,17 @@ impl Store {
                 is_subagent: r.get::<_, i64>(8)? != 0,
                 parent_session_id: r.get(9)?,
                 source_alive: r.get::<_, i64>(10)? != 0,
-                event_count: r.get(11)?,
-                tokens_in: r.get(12)?,
-                tokens_out: r.get(13)?,
-                context_tokens: r.get(14)?,
-                peak_tokens_in: r.get(15)?,
+                // Derived, not stored — see crate::paths::account_label. The raw
+                // path never leaves the backend (it contains the OS username).
+                account: r
+                    .get::<_, Option<String>>(11)?
+                    .as_deref()
+                    .and_then(crate::paths::account_label),
+                event_count: r.get(12)?,
+                tokens_in: r.get(13)?,
+                tokens_out: r.get(14)?,
+                context_tokens: r.get(15)?,
+                peak_tokens_in: r.get(16)?,
                 live: is_live(updated_at.as_deref(), &now),
             })
         })?;
@@ -1171,14 +1188,55 @@ impl Store {
             .map(|n| n as usize)
     }
 
-    /// Persist settings (0600) and apply retention immediately.
+    /// Claude Code home directories to ingest: the implicit `~/.claude` first,
+    /// then each configured extra dir. Entries are expanded, existence-filtered
+    /// and deduped (by canonical path, so a symlink or a re-added `~/.claude`
+    /// can't be watched twice).
+    pub fn claude_home_dirs(&self) -> Vec<std::path::PathBuf> {
+        let configured = self.inner.settings.lock().unwrap().claude_dirs.clone();
+        let mut out: Vec<std::path::PathBuf> = Vec::new();
+        let mut seen: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        let default = dirs::home_dir().map(|h| h.join(".claude"));
+        for dir in default.into_iter().chain(
+            configured
+                .iter()
+                .filter_map(|d| crate::paths::expand_home(d)),
+        ) {
+            if !dir.is_dir() {
+                continue;
+            }
+            // canonicalize resolves symlinks; fall back to the literal path so a
+            // permission error can't silently drop a valid directory.
+            let key = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+            if seen.insert(key) {
+                out.push(dir);
+            }
+        }
+        out
+    }
+
+    /// Monotonic settings counter — see [`Inner::settings_gen`].
+    pub fn settings_gen(&self) -> u64 {
+        self.inner
+            .settings_gen
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Persist settings (0600) and apply retention immediately. `claude_dirs` is
+    /// normalized (expanded, deduped, blanks dropped) before it is written.
     pub fn set_settings(&self, s: Settings) -> Result<Settings> {
+        let mut s = s;
+        s.claude_dirs = normalize_claude_dirs(&s.claude_dirs);
         *self.inner.settings.lock().unwrap() = s.clone();
         if let Some(p) = &self.inner.settings_path {
             std::fs::write(p, serde_json::to_string_pretty(&s)?)
                 .with_context(|| format!("write {}", p.display()))?;
             set_owner_only_perms(p);
         }
+        self.inner
+            .settings_gen
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.enforce_retention()?;
         Ok(s)
     }
@@ -1514,6 +1572,29 @@ fn to_fts_query(input: &str) -> Option<String> {
     } else {
         Some(terms.join(" "))
     }
+}
+
+/// Normalize the user-supplied extra Claude directories: expand `~`, drop
+/// blanks and anything that can't be resolved to an absolute path, dedupe, and
+/// store back in `~`-relative display form. Order is preserved.
+///
+/// Storing the display form keeps settings.json free of the absolute home path
+/// (which embeds the OS username) and lets it match the strings the UI shows
+/// one-for-one. Non-existent directories are kept — one on an unmounted volume
+/// should survive a restart — and skipped at read time by
+/// [`Store::claude_home_dirs`].
+fn normalize_claude_dirs(dirs: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for d in dirs {
+        let Some(p) = crate::paths::expand_home(d) else {
+            continue;
+        };
+        if seen.insert(p.clone()) {
+            out.push(crate::paths::display_home(&p));
+        }
+    }
+    out
 }
 
 fn with_suffix(path: &Path, suffix: &str) -> std::path::PathBuf {
@@ -2274,7 +2355,7 @@ mod tests {
     #[test]
     fn retention_early_out_when_under_cap() {
         let store = Store::open_in_memory().unwrap();
-        store.set_settings(Settings { backfill_file_limit: None, max_sessions_per_agent: Some(10), catalog_fetch_enabled: false }).unwrap();
+        store.set_settings(Settings { backfill_file_limit: None, max_sessions_per_agent: Some(10), catalog_fetch_enabled: false , ..Settings::default() }).unwrap();
         store
             .commit_batches("/f", 1, vec![NormalizedBatch { session: Some(session("cc:s1")), events: vec![] }])
             .unwrap();
@@ -2286,7 +2367,7 @@ mod tests {
     fn retention_prunes_oldest_and_all_its_events_chunked() {
         let store = Store::open_in_memory().unwrap();
         // keep only 1 per agent
-        store.set_settings(Settings { backfill_file_limit: None, max_sessions_per_agent: Some(1), catalog_fetch_enabled: false }).unwrap();
+        store.set_settings(Settings { backfill_file_limit: None, max_sessions_per_agent: Some(1), catalog_fetch_enabled: false , ..Settings::default() }).unwrap();
 
         let mut old = session("cc:old");
         old.updated_at = Some("2026-08-01T00:00:00Z".to_string());
@@ -2449,16 +2530,76 @@ mod tests {
     fn settings_roundtrip_and_backfill_limit() {
         let store = Store::open_in_memory().unwrap();
         let s = store
-            .set_settings(Settings { backfill_file_limit: Some(50), max_sessions_per_agent: None, catalog_fetch_enabled: false })
+            .set_settings(Settings { backfill_file_limit: Some(50), max_sessions_per_agent: None, catalog_fetch_enabled: false , ..Settings::default() })
             .unwrap();
         assert_eq!(s.backfill_file_limit, Some(50));
         assert_eq!(store.settings().backfill_file_limit, Some(50));
         assert_eq!(store.backfill_file_limit(), Some(50));
         // 0 / negative → treated as "no limit"
         store
-            .set_settings(Settings { backfill_file_limit: Some(0), max_sessions_per_agent: Some(0), catalog_fetch_enabled: false })
+            .set_settings(Settings { backfill_file_limit: Some(0), max_sessions_per_agent: Some(0), catalog_fetch_enabled: false , ..Settings::default() })
             .unwrap();
         assert_eq!(store.backfill_file_limit(), None);
+    }
+
+    #[test]
+    fn claude_dirs_normalize_expand_dedupe_and_bump_the_generation() {
+        let store = Store::open_in_memory().unwrap();
+        let gen0 = store.settings_gen();
+        let saved = store
+            .set_settings(Settings {
+                claude_dirs: vec![
+                    "~/.claude-alpha".into(),
+                    "  ~/.claude-alpha/  ".into(), // same dir, sloppy input
+                    "".into(),                     // blank
+                    "relative/dir".into(),         // not absolute
+                ],
+                ..Settings::default()
+            })
+            .unwrap();
+        assert_eq!(
+            saved.claude_dirs,
+            vec!["~/.claude-alpha".to_string()],
+            "deduped and stored ~-relative; blanks and relative paths dropped"
+        );
+        assert!(
+            store.settings_gen() > gen0,
+            "the ingest loop polls this to re-sync its watch list"
+        );
+    }
+
+    #[test]
+    fn claude_home_dirs_always_includes_the_default_and_never_twice() {
+        let store = Store::open_in_memory().unwrap();
+        let home = dirs::home_dir().unwrap();
+        // Re-adding ~/.claude by hand must not double-watch it.
+        store
+            .set_settings(Settings {
+                claude_dirs: vec!["~/.claude".into(), "~/.claude-definitely-absent".into()],
+                ..Settings::default()
+            })
+            .unwrap();
+        let dirs = store.claude_home_dirs();
+        assert_eq!(
+            dirs.iter().filter(|d| *d == &home.join(".claude")).count(),
+            usize::from(home.join(".claude").is_dir()),
+            "the default root appears at most once"
+        );
+        assert!(
+            !dirs.iter().any(|d| d.ends_with(".claude-definitely-absent")),
+            "a non-existent directory is skipped at read time"
+        );
+    }
+
+    #[test]
+    fn settings_written_before_claude_dirs_still_parse() {
+        // Backward compatibility: an existing settings.json has no claudeDirs.
+        let old: Settings = serde_json::from_str(
+            r#"{"backfillFileLimit":10,"maxSessionsPerAgent":5,"catalogFetchEnabled":true}"#,
+        )
+        .unwrap();
+        assert!(old.claude_dirs.is_empty());
+        assert_eq!(old.backfill_file_limit, Some(10));
     }
 
     #[test]

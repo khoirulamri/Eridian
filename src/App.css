@@ -916,6 +916,19 @@ body {
   color: var(--amber);
   border-color: var(--amber);
 }
+/* Which Claude directory a session came from (multi-account setups). Tinted
+   with the Claude Code accent; the label is a directory name, so it keeps its
+   literal casing instead of the uppercase treatment the other tags use. */
+.tag.account {
+  color: var(--cc);
+  border-color: color-mix(in srgb, var(--cc) 45%, transparent);
+  text-transform: none;
+  letter-spacing: 0.02em;
+  max-width: 90px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 
 /* ── Timeline ──────────────────────────────────────────────────────────── */
 
@@ -2231,6 +2244,85 @@ h6.md-h {
 }
 .settings-hint {
   font-size: 11px;
+}
+
+/* ── Settings → Watched directories (multi-account Claude Code) ───────────── */
+
+.settings-dirs .dir-list {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  border: 1px solid var(--hairline);
+  border-radius: 5px;
+  overflow: hidden;
+}
+.settings-dirs .dir-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--hairline);
+}
+.settings-dirs .dir-row:last-child {
+  border-bottom: none;
+}
+.settings-dirs .dir-row .settings-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  word-break: normal;
+}
+.settings-dirs .dir-count,
+.settings-dirs .dir-fixed {
+  flex: none;
+  font-size: 11px;
+}
+.settings-dirs .dir-remove {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  line-height: 1;
+  background: none;
+  border: 1px solid var(--hairline);
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 14px;
+  cursor: pointer;
+}
+.settings-dirs .dir-remove:hover:not(:disabled) {
+  color: var(--amber);
+  border-color: var(--amber);
+}
+.settings-dirs .dir-remove:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.settings-dirs .dir-detected {
+  margin-top: 14px;
+}
+/* A path needs more room than the 200px number fields in the Ingest card. */
+.settings-dirs .dir-add input {
+  flex: 1 1 auto;
+  min-width: 0;
+  max-width: 420px;
+  background: var(--base);
+  border: 1px solid var(--hairline);
+  border-radius: 5px;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  padding: 6px 10px;
+  outline: none;
+}
+.settings-dirs .dir-add input:focus {
+  border-color: var(--muted);
+}
+.settings-dirs .dir-error {
+  margin: 8px 0 0;
+  font-size: 11px;
+  color: var(--amber);
 }
 
 /* skills panel */

@@ -9,6 +9,7 @@ mod ingest;
 mod inspect;
 mod mcp_config;
 mod normalize;
+mod paths;
 mod shell;
 mod skills_config;
 mod store;
@@ -100,6 +101,8 @@ pub fn run() {
             commands::db_info,
             commands::get_settings,
             commands::set_settings,
+            commands::claude_dirs_status,
+            commands::inspect_claude_dir,
             commands::rebuild_db,
         ])
         .build(tauri::generate_context!())

@@ -86,6 +86,10 @@ pub struct SessionRow {
     pub is_subagent: bool,
     pub parent_session_id: Option<String>,
     pub source_alive: bool,
+    /// Short account label for multi-account Claude Code setups, derived from
+    /// the transcript's watch directory (`~/.claude-work` → `work`). `None` for
+    /// the default `~/.claude` root and for OpenCode sessions.
+    pub account: Option<String>,
     pub event_count: i64,
     /// Σ input / output tokens across the session's events (cost rollup).
     pub tokens_in: i64,
@@ -679,6 +683,130 @@ pub fn set_settings(
     store.set_settings(settings).map_err(err)
 }
 
+/// One watchable Claude Code home directory, for the Settings list.
+///
+/// `path` is the display form (`~/.claude-work`) — the absolute path is never
+/// sent to the frontend because it embeds the OS username.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ClaudeDirInfo {
+    pub path: String,
+    /// Derived account label shown on session rows (`None` for `~/.claude`).
+    pub label: Option<String>,
+    /// Number of project folders under `projects/` (0 when missing/unreadable).
+    pub project_count: usize,
+    /// Whether `<path>/projects` exists and is readable.
+    pub exists: bool,
+    /// "default" (implicit ~/.claude) | "configured" | "detected"
+    pub kind: String,
+}
+
+/// Describe one Claude home directory. Read-only: a directory listing, nothing else.
+fn describe_claude_dir(dir: &std::path::Path, kind: &str) -> ClaudeDirInfo {
+    let projects = dir.join("projects");
+    let entries = std::fs::read_dir(&projects)
+        .map(|rd| rd.filter_map(Result::ok).filter(|e| e.path().is_dir()).count());
+    ClaudeDirInfo {
+        path: crate::paths::display_home(dir),
+        // Run a representative transcript path through the same derivation the
+        // session rows use, so the Settings list and the timeline chips can
+        // never disagree about what this directory is called.
+        label: crate::paths::account_label(&projects.join("p").join("s.jsonl").to_string_lossy()),
+        project_count: entries.as_ref().copied().unwrap_or(0),
+        exists: entries.is_ok(),
+        kind: kind.to_string(),
+    }
+}
+
+/// The Settings "Watched directories" list: the implicit `~/.claude`, every
+/// configured extra directory, then any sibling `~/.claude*` directory that
+/// looks like another account but isn't watched yet ("detected").
+///
+/// The detection scan replaces a native folder picker — it needs no new
+/// dependency and finds the conventional `CLAUDE_CONFIG_DIR` layout in one click.
+#[tauri::command(async)]
+pub fn claude_dirs_status(store: State<crate::store::Store>) -> Vec<ClaudeDirInfo> {
+    let home = dirs::home_dir();
+    let default = home.as_ref().map(|h| h.join(".claude"));
+    let configured: Vec<std::path::PathBuf> = store
+        .settings()
+        .claude_dirs
+        .iter()
+        .filter_map(|d| crate::paths::expand_home(d))
+        .collect();
+
+    let mut out: Vec<ClaudeDirInfo> = Vec::new();
+    let mut known: std::collections::HashSet<std::path::PathBuf> =
+        std::collections::HashSet::new();
+    if let Some(d) = &default {
+        known.insert(d.clone());
+        out.push(describe_claude_dir(d, "default"));
+    }
+    for d in &configured {
+        // A user could re-add ~/.claude by hand; show it once, as the default.
+        if !known.insert(d.clone()) {
+            continue;
+        }
+        out.push(describe_claude_dir(d, "configured"));
+    }
+
+    // Detect: sibling ~/.claude* dirs holding a projects/ tree.
+    if let Some(home) = &home {
+        for d in detect_claude_dirs(home, &known) {
+            out.push(describe_claude_dir(&d, "detected"));
+        }
+    }
+    out
+}
+
+/// Sibling `~/.claude*` directories that hold a `projects/` tree and aren't
+/// already watched — the zero-dependency stand-in for a folder picker, matching
+/// the conventional `CLAUDE_CONFIG_DIR` layout. Sorted for a stable list.
+fn detect_claude_dirs(
+    home: &std::path::Path,
+    known: &std::collections::HashSet<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(home)
+        .into_iter()
+        .flatten()
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".claude"))
+                && p.join("projects").is_dir()
+                && !known.contains(p)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// Validate a directory the user typed into Settings before it is added.
+/// `exists` false means "no projects/ subdirectory" — the caller shows the error.
+#[tauri::command(async)]
+pub fn inspect_claude_dir(
+    store: State<crate::store::Store>,
+    path: String,
+) -> Result<ClaudeDirInfo, String> {
+    let dir = crate::paths::expand_home(&path)
+        .ok_or_else(|| "Enter an absolute path (or one starting with ~/).".to_string())?;
+    let already = store.claude_home_dirs().iter().any(|d| d == &dir);
+    let mut info = describe_claude_dir(&dir, if already { "configured" } else { "detected" });
+    if !dir.is_dir() {
+        return Err(format!("{} does not exist.", info.path));
+    }
+    if !info.exists {
+        return Err(format!("{} has no projects/ folder.", info.path));
+    }
+    if already {
+        return Err(format!("{} is already watched.", info.path));
+    }
+    info.kind = "detected".into();
+    Ok(info)
+}
+
 /// Wipe the derived cache and re-ingest from scratch (background thread).
 #[tauri::command(async)]
 pub fn rebuild_db(store: State<crate::store::Store>) -> Result<(), String> {
@@ -826,6 +954,54 @@ fn err(e: anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detect_finds_sibling_claude_dirs_with_transcripts() {
+        let home = std::env::temp_dir().join(format!("eridian_detect_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        // Two real-looking accounts, plus decoys that must NOT be offered.
+        for name in [".claude", ".claude-alpha"] {
+            std::fs::create_dir_all(home.join(name).join("projects")).unwrap();
+        }
+        std::fs::create_dir_all(home.join(".claude-empty")).unwrap(); // no projects/
+        std::fs::create_dir_all(home.join(".config").join("projects")).unwrap(); // wrong prefix
+        std::fs::write(home.join(".claude.json"), "{}").unwrap(); // a file, not a dir
+
+        // ~/.claude is already watched, so only the extra account is offered.
+        let known = std::collections::HashSet::from([home.join(".claude")]);
+        let found = detect_claude_dirs(&home, &known);
+        assert_eq!(found, vec![home.join(".claude-alpha")]);
+
+        // Once it's watched too, nothing is left to detect.
+        let known = std::collections::HashSet::from([
+            home.join(".claude"),
+            home.join(".claude-alpha"),
+        ]);
+        assert!(detect_claude_dirs(&home, &known).is_empty());
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn describe_claude_dir_reports_label_and_project_count() {
+        let home = std::env::temp_dir().join(format!("eridian_describe_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        let dir = home.join(".claude-alpha");
+        std::fs::create_dir_all(dir.join("projects").join("p1")).unwrap();
+        std::fs::create_dir_all(dir.join("projects").join("p2")).unwrap();
+
+        let info = describe_claude_dir(&dir, "configured");
+        assert_eq!(info.label.as_deref(), Some("alpha"));
+        assert_eq!(info.project_count, 2);
+        assert!(info.exists);
+        assert_eq!(info.kind, "configured");
+
+        // A directory with no projects/ is reported, not hidden — the Settings
+        // list has to be able to show why it is inert.
+        let missing = describe_claude_dir(&home.join(".claude-gone"), "configured");
+        assert!(!missing.exists);
+        assert_eq!(missing.project_count, 0);
+        let _ = std::fs::remove_dir_all(&home);
+    }
 
     #[test]
     fn push_capped_keeps_most_recent() {

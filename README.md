@@ -82,8 +82,13 @@ one event model, and gives you a fast, searchable, review-oriented UI over all o
 
 | Agent | Live ingest | Offline history |
 |---|---|---|
-| Claude Code | ✅ filesystem watcher + tail | ✅ (reads `~/.claude/projects`) |
+| Claude Code | ✅ filesystem watcher + tail | ✅ (reads `~/.claude/projects`, plus any extra directories added in Settings) |
 | OpenCode | ✅ REST + SSE (`opencode serve`) | ✅ cold-import from `opencode.db` |
+
+Running several Claude Code accounts? Add each account's Claude home directory (the
+one its `CLAUDE_CONFIG_DIR` points at) under **Settings → Watched directories** —
+Eridian ingests them all and tags each session with a short account label. Sibling
+`~/.claude*` directories are detected automatically and offered with an **Add** button.
 
 Codex, Gemini CLI, and read-only panels for other agents are on the [roadmap](#roadmap).
 

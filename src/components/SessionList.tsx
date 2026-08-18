@@ -221,6 +221,11 @@ function SessionRowItem({
           {s.live && <span className="live-dot-sm" style={{ background: accent }} aria-hidden />}
           {label}
           {s.isSubagent && <span className="tag">subagent</span>}
+          {s.account && (
+            <span className="tag account" title={`Claude directory: ~/.claude-${s.account}`}>
+              {s.account}
+            </span>
+          )}
           {!s.sourceAlive && (
             <span className="tag archived" title="Source JSONL purged — data preserved in Eridian">
               archived

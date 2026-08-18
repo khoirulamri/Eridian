@@ -280,6 +280,14 @@ export function Timeline({
               </span>
             )}
             <span>updated {relativeTime(session.updatedAt)}</span>
+            {session.account && (
+              <span
+                className="tag account"
+                title={`Ingested from the ~/.claude-${session.account} directory`}
+              >
+                {session.account}
+              </span>
+            )}
             {!session.sourceAlive && (
               <span
                 className="tag archived"

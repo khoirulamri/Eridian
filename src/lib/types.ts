@@ -26,6 +26,9 @@ export interface SessionRow {
   isSubagent: boolean;
   parentSessionId: string | null;
   sourceAlive: boolean;
+  /** Short account label for multi-account Claude Code setups (`~/.claude-work`
+   *  → `work`). Null for the default `~/.claude` root and for OpenCode. */
+  account: string | null;
   eventCount: number;
   tokensIn: number;
   tokensOut: number;
@@ -244,6 +247,19 @@ export interface Settings {
   backfillFileLimit: number | null;
   maxSessionsPerAgent: number | null;
   catalogFetchEnabled: boolean;
+  /** Extra Claude Code home directories to ingest, on top of `~/.claude`. */
+  claudeDirs: string[];
+}
+
+/** One watchable Claude Code home directory (Settings → Watched directories). */
+export interface ClaudeDirInfo {
+  /** Display form, e.g. `~/.claude-work` — never the raw absolute path. */
+  path: string;
+  label: string | null;
+  projectCount: number;
+  /** Whether `<path>/projects` exists and is readable. */
+  exists: boolean;
+  kind: "default" | "configured" | "detected";
 }
 
 // ── catalog (Skills & MCP marketplace) — mirrors src-tauri/src/catalog ───────

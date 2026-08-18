@@ -1,6 +1,8 @@
 //! Claude Code ingester.
 //!
-//! Sources: ~/.claude/projects/<encoded-cwd>/*.jsonl and .../subagents/agent-*.jsonl
+//! Sources: <claude-home>/projects/<encoded-cwd>/*.jsonl and .../subagents/agent-*.jsonl
+//! where <claude-home> is `~/.claude` plus every extra directory the user added in
+//! Settings (multi-account: each `CLAUDE_CONFIG_DIR` has its own projects/ tree).
 //! Strategy: initial backfill walk, then `notify` watcher → per-file byte-offset tail.
 //! Every write batch commits events + new offset in ONE transaction (restart-safe,
 //! duplicate-safe via the uq_events_source index).
@@ -27,22 +29,34 @@ const FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 /// Reconciliation sweep cadence — catches notify events the OS dropped.
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
-pub fn claude_projects_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|h| h.join(".claude").join("projects"))
+/// Every transcript root to ingest: `<claude-home>/projects` for the default
+/// home and each extra directory configured in Settings, existence-filtered.
+///
+/// Mirrors the multi-root shape already used by `skills_config::read_all` —
+/// discovery here, the walk in a function that takes explicit roots, so both
+/// stay testable against a temp tree.
+pub fn claude_projects_dirs(store: &Store) -> Vec<PathBuf> {
+    projects_dirs_of(&store.claude_home_dirs())
+}
+
+/// Map Claude home directories to their `projects/` subdirectory, dropping any
+/// that doesn't exist. Split out from [`claude_projects_dirs`] for testing.
+fn projects_dirs_of(homes: &[PathBuf]) -> Vec<PathBuf> {
+    homes
+        .iter()
+        .map(|h| h.join("projects"))
+        .filter(|p| p.is_dir())
+        .collect()
 }
 
 /// Blocking entry point. Run on a dedicated thread (keeps the watcher alive):
 /// initial backfill, then watch + debounced tail + periodic reconciliation sweep.
+///
+/// The set of watched roots is re-read whenever Settings change, so adding or
+/// removing a Claude directory takes effect without restarting the app. The loop
+/// is entered even when no root exists yet — otherwise a directory added later
+/// would never be picked up.
 pub fn run(store: Store) -> Result<()> {
-    let Some(root) = claude_projects_dir() else {
-        tracing::info!("no home dir; claude_code ingest disabled");
-        return Ok(());
-    };
-    if !root.exists() {
-        tracing::info!(path = %root.display(), "claude projects dir missing; ingest idle");
-        return Ok(());
-    }
-
     // 1. Backfill with progress reporting so the window fills in as it runs.
     let n = backfill(&store, true)?;
     tracing::info!(files = n, "claude_code backfill complete");
@@ -63,10 +77,10 @@ pub fn run(store: Store) -> Result<()> {
         let _ = tx.send(res);
     })
     .context("create fs watcher")?;
-    watcher
-        .watch(&root, RecursiveMode::Recursive)
-        .with_context(|| format!("watch {}", root.display()))?;
-    tracing::info!(path = %root.display(), "watching claude projects");
+    // One watcher, N watched roots (notify supports repeated watch/unwatch).
+    let mut watched: HashSet<PathBuf> = HashSet::new();
+    sync_watched_roots(&mut watcher, &mut watched, &claude_projects_dirs(&store));
+    let mut settings_gen = store.settings_gen();
 
     // 3. Drain loop: coalesce changes, flush ≤ every FLUSH_INTERVAL, sweep every 30s.
     let mut pending: HashSet<PathBuf> = HashSet::new();
@@ -86,6 +100,42 @@ pub fn run(store: Store) -> Result<()> {
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         }
 
+        // Settings changed → apply the new watch list right away. One relaxed
+        // atomic load per tick, so this is free when nothing changed.
+        let gen = store.settings_gen();
+        if gen != settings_gen {
+            settings_gen = gen;
+            let roots = claude_projects_dirs(&store);
+            let added = sync_watched_roots(&mut watcher, &mut watched, &roots);
+            if !added.is_empty() {
+                // Backfill only what's new — re-walking every root would stall
+                // the loop for minutes on a large archive. Live tailing pauses
+                // for the duration; notify's channel is unbounded, so the events
+                // that arrive meanwhile are drained on the next iteration.
+                let files = match backfill_roots(&store, &added, true) {
+                    Ok(files) => {
+                        tracing::info!(roots = added.len(), files, "backfilled added roots");
+                        files
+                    }
+                    Err(e) => {
+                        tracing::warn!("backfill of added roots failed: {e:#}");
+                        0
+                    }
+                };
+                let _ = store.enforce_retention();
+                let _ = store.reconcile_source_alive();
+                store.emit_sessions_updated();
+                // Back to the steady state (also clears the Settings spinner).
+                store.emit_progress(crate::store::IngestProgress {
+                    phase: "watching".into(),
+                    files_done: files,
+                    files_total: files,
+                    events: 0,
+                    done: true,
+                });
+            }
+        }
+
         if !pending.is_empty() && last_flush.elapsed() >= FLUSH_INTERVAL {
             for path in pending.drain() {
                 if let Err(e) = tail_file(&store, &path, true) {
@@ -99,7 +149,11 @@ pub fn run(store: Store) -> Result<()> {
             // backfill() re-tails every file from its stored offset → picks up
             // any change the watcher missed (atomic writes, dropped events).
             // Silent (report=false): the sweep must not spam progress events.
-            if let Err(e) = backfill(&store, false) {
+            // It also re-syncs the watch list, so a configured directory that
+            // only just appeared on disk starts being watched.
+            let roots = claude_projects_dirs(&store);
+            sync_watched_roots(&mut watcher, &mut watched, &roots);
+            if let Err(e) = backfill_roots(&store, &roots, false) {
                 tracing::warn!("reconciliation sweep failed: {e:#}");
             }
             let _ = store.enforce_retention();
@@ -110,25 +164,60 @@ pub fn run(store: Store) -> Result<()> {
     Ok(())
 }
 
+/// Bring the watcher in line with `desired`: watch what's new, unwatch what's
+/// gone. Returns the roots that were newly watched (the caller backfills those).
+/// Never fails the loop — a root that can't be watched is logged and skipped, so
+/// one bad directory can't take the whole ingester down.
+fn sync_watched_roots(
+    watcher: &mut dyn Watcher,
+    watched: &mut HashSet<PathBuf>,
+    desired: &[PathBuf],
+) -> Vec<PathBuf> {
+    let want: HashSet<PathBuf> = desired.iter().cloned().collect();
+    for stale in watched.difference(&want).cloned().collect::<Vec<_>>() {
+        if let Err(e) = watcher.unwatch(&stale) {
+            tracing::warn!(path = %stale.display(), "unwatch failed: {e}");
+        }
+        watched.remove(&stale);
+        tracing::info!(path = %stale.display(), "stopped watching claude projects");
+    }
+    let mut added = Vec::new();
+    for root in desired {
+        if watched.contains(root) {
+            continue;
+        }
+        match watcher.watch(root, RecursiveMode::Recursive) {
+            Ok(()) => {
+                watched.insert(root.clone());
+                added.push(root.clone());
+                tracing::info!(path = %root.display(), "watching claude projects");
+            }
+            Err(e) => tracing::warn!(path = %root.display(), "watch failed: {e}"),
+        }
+    }
+    added
+}
+
 fn is_jsonl(p: &Path) -> bool {
     p.extension().and_then(|e| e.to_str()) == Some("jsonl")
 }
 
-/// Backfill: walk all *.jsonl (incl. subagents/) and tail each from its stored
-/// offset (0 on first run). Individual events aren't pushed to the timeline, but
-/// when `report` is set, a throttled progress signal + periodic list refresh let
-/// the UI show the archive filling in. Returns number of files touched.
+/// Backfill every configured root: walk all *.jsonl (incl. subagents/) and tail
+/// each from its stored offset (0 on first run). Individual events aren't pushed
+/// to the timeline, but when `report` is set, a throttled progress signal +
+/// periodic list refresh let the UI show the archive filling in. Returns number
+/// of files touched.
 pub fn backfill(store: &Store, report: bool) -> Result<usize> {
-    let Some(root) = claude_projects_dir() else {
-        return Ok(0);
-    };
-    if !root.exists() {
-        return Ok(0);
-    }
-    let mut files: Vec<PathBuf> = walkdir(&root)?.into_iter().filter(|p| is_jsonl(p)).collect();
-    // Respect the configured backfill file limit (Settings page).
-    if let Some(limit) = store.backfill_file_limit() {
-        files.truncate(limit);
+    backfill_roots(store, &claude_projects_dirs(store), report)
+}
+
+/// Backfill exactly the given roots. Used by [`backfill`] for a full pass and by
+/// the watch loop to backfill a single directory the user just added.
+pub fn backfill_roots(store: &Store, roots: &[PathBuf], report: bool) -> Result<usize> {
+    let limit = store.backfill_file_limit();
+    let mut files: Vec<PathBuf> = Vec::new();
+    for root in roots {
+        files.extend(root_files(root, limit)?);
     }
     let total = files.len();
 
@@ -170,6 +259,29 @@ pub fn backfill(store: &Store, report: bool) -> Result<usize> {
         store.emit_sessions_updated();
     }
     Ok(total)
+}
+
+/// The transcript files of ONE root, newest first, capped at `limit`.
+///
+/// The cap is applied per root so a busy account can't starve the others, and
+/// the sort makes it deterministic: `walkdir` returns files in stack-pop order,
+/// so a plain truncate kept an arbitrary subset. mtime is read best-effort — an
+/// unreadable entry sorts last rather than aborting the walk.
+fn root_files(root: &Path, limit: Option<usize>) -> Result<Vec<PathBuf>> {
+    let mut files: Vec<PathBuf> = walkdir(root)?.into_iter().filter(|p| is_jsonl(p)).collect();
+    if let Some(limit) = limit {
+        if files.len() > limit {
+            files.sort_by_key(|p| {
+                std::cmp::Reverse(
+                    std::fs::metadata(p)
+                        .and_then(|m| m.modified())
+                        .unwrap_or(std::time::UNIX_EPOCH),
+                )
+            });
+            files.truncate(limit);
+        }
+    }
+    Ok(files)
 }
 
 /// Tail one JSONL file from its persisted byte offset. Idempotent; safe to call
@@ -684,6 +796,150 @@ mod tests {
         PathBuf::from("/home/u/.claude/projects/proj/s1.jsonl")
     }
 
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// Build a throwaway tree of fake Claude homes:
+    /// `<tmp>/<name>/projects/proj/s<i>.jsonl`, one transcript line per file.
+    fn temp_homes(names: &[&str], files_per_home: usize) -> (PathBuf, Vec<PathBuf>) {
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let base = std::env::temp_dir().join(format!("eridian_cc_{}_{}", std::process::id(), n));
+        let mut homes = Vec::new();
+        for name in names {
+            let home = base.join(name);
+            let proj = home.join("projects").join("proj");
+            std::fs::create_dir_all(&proj).unwrap();
+            for i in 0..files_per_home {
+                // Session ids must stay globally unique — a real multi-account
+                // setup never shares a UUID between homes.
+                let sid = format!("{name}-{i}");
+                std::fs::write(
+                    proj.join(format!("{sid}.jsonl")),
+                    format!(
+                        r#"{{"type":"user","sessionId":"{sid}","uuid":"u-{sid}","timestamp":"2026-08-08T00:00:00Z","cwd":"/work/proj","message":{{"role":"user","content":"hi"}}}}"#
+                    ) + "\n",
+                )
+                .unwrap();
+            }
+            homes.push(home);
+        }
+        (base, homes)
+    }
+
+    #[test]
+    fn sync_watched_roots_adds_removes_and_reports_only_the_new() {
+        // This is the live-apply mechanism: on a Settings change the loop diffs
+        // the desired roots against what it already watches and backfills only
+        // the additions (re-walking everything would stall it for minutes).
+        let (base, homes) = temp_homes(&[".claude", ".claude-alpha"], 1);
+        let roots = projects_dirs_of(&homes);
+        let (tx, _rx) = std::sync::mpsc::channel::<notify::Result<notify::Event>>();
+        let mut watcher = notify::recommended_watcher(move |res| {
+            let _ = tx.send(res);
+        })
+        .unwrap();
+        let mut watched: HashSet<PathBuf> = HashSet::new();
+
+        let added = sync_watched_roots(&mut watcher, &mut watched, &roots);
+        assert_eq!(added.len(), 2, "both roots are new on the first sync");
+        assert_eq!(watched.len(), 2);
+
+        // Idempotent: re-syncing the same list watches nothing again, so the
+        // caller doesn't re-backfill on every tick.
+        assert!(sync_watched_roots(&mut watcher, &mut watched, &roots).is_empty());
+
+        // Adding one root reports exactly that root.
+        let mut watched_one: HashSet<PathBuf> = HashSet::new();
+        let _ = sync_watched_roots(&mut watcher, &mut watched_one, &roots[..1]);
+        let added = sync_watched_roots(&mut watcher, &mut watched_one, &roots);
+        assert_eq!(added, vec![roots[1].clone()]);
+
+        // Removing a root unwatches it and reports no additions.
+        let added = sync_watched_roots(&mut watcher, &mut watched, &roots[..1]);
+        assert!(added.is_empty());
+        assert_eq!(watched, HashSet::from([roots[0].clone()]));
+
+        // A directory that can't be watched is skipped, not fatal.
+        let bogus = vec![base.join("definitely-absent")];
+        assert!(sync_watched_roots(&mut watcher, &mut watched, &bogus).is_empty());
+        assert!(watched.is_empty(), "the old root was still unwatched");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn projects_dirs_of_appends_projects_and_drops_missing() {
+        let (base, homes) = temp_homes(&[".claude", ".claude-alpha"], 1);
+        let mut with_missing = homes.clone();
+        with_missing.push(base.join(".claude-gone"));
+        let dirs = projects_dirs_of(&with_missing);
+        assert_eq!(dirs.len(), 2, "the non-existent home must be skipped");
+        assert!(dirs.iter().all(|d| d.ends_with("projects")));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn backfill_roots_ingests_every_root() {
+        let (base, homes) = temp_homes(&[".claude", ".claude-alpha", ".claude-beta"], 2);
+        let store = Store::open_in_memory().unwrap();
+        let roots = projects_dirs_of(&homes);
+        let files = backfill_roots(&store, &roots, false).unwrap();
+        assert_eq!(files, 6, "2 files x 3 roots");
+
+        let sessions = store.list_sessions(None).unwrap();
+        assert_eq!(sessions.len(), 6);
+        // Each session carries the account label derived from its own root.
+        let mut labels: Vec<Option<String>> =
+            sessions.iter().map(|s| s.account.clone()).collect();
+        labels.sort();
+        labels.dedup();
+        assert_eq!(
+            labels,
+            vec![None, Some("alpha".to_string()), Some("beta".to_string())],
+            "default root unlabeled, extras labeled by directory name"
+        );
+
+        // Idempotent: a second pass (restart / sweep) adds nothing.
+        backfill_roots(&store, &roots, false).unwrap();
+        assert_eq!(store.list_sessions(None).unwrap().len(), 6);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn backfill_file_limit_applies_per_root_not_globally() {
+        // A global truncate would let one busy account starve the others; the
+        // cap is per root so every account keeps its most recent transcripts.
+        let (base, homes) = temp_homes(&[".claude", ".claude-alpha"], 3);
+        let roots = projects_dirs_of(&homes);
+        for root in &roots {
+            assert_eq!(root_files(root, Some(2)).unwrap().len(), 2);
+            assert_eq!(root_files(root, None).unwrap().len(), 3);
+            // A limit above the file count is a no-op.
+            assert_eq!(root_files(root, Some(9)).unwrap().len(), 3);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn root_files_keeps_the_newest_when_capped() {
+        // Truncation must be deterministic: walkdir returns files in stack-pop
+        // order, so a plain truncate kept an arbitrary subset of the archive.
+        let (base, homes) = temp_homes(&[".claude-alpha"], 3);
+        let root = homes[0].join("projects");
+        let mut all = root_files(&root, None).unwrap();
+        all.sort();
+        let target = all[0].clone();
+        // Rewriting the file bumps its mtime — no extra dependency needed.
+        std::thread::sleep(Duration::from_millis(50));
+        let content = std::fs::read(&target).unwrap();
+        std::fs::write(&target, content).unwrap();
+
+        assert_eq!(
+            root_files(&root, Some(1)).unwrap(),
+            vec![target],
+            "the most recently modified file survives the cap"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn user_string_content_is_one_user_event() {
         let raw = r#"{"type":"user","sessionId":"s1","uuid":"u1","timestamp":"2026-08-08T00:00:00Z","cwd":"/proj","gitBranch":"main","message":{"role":"user","content":"hello"}}"#;
@@ -891,6 +1147,78 @@ mod tests {
         assert_eq!(b.events[0].session_id, "cc:agent-xyz");
     }
 
+    /// End-to-end live-apply: start the real watch loop, then add a directory
+    /// through `set_settings` and assert its sessions land WITHOUT a restart.
+    ///
+    /// Ignored by default because `run()` also picks up this machine's real
+    /// `~/.claude` (the default root is implicit) and never returns — the thread
+    /// is left to die with the test process.
+    /// Run: `cargo test -- --ignored live_apply --nocapture`.
+    #[test]
+    #[ignore]
+    fn adding_a_directory_is_picked_up_without_a_restart() {
+        let (base, homes) = temp_homes(&[".claude-liveadd"], 2);
+        let store = Store::open_in_memory().unwrap();
+        let watcher_store = store.clone();
+        std::thread::spawn(move || {
+            let _ = run(watcher_store);
+        });
+        // Let the initial backfill + watcher setup settle.
+        std::thread::sleep(Duration::from_millis(1500));
+        let before = store
+            .list_sessions(None)
+            .unwrap()
+            .iter()
+            .filter(|s| s.account.as_deref() == Some("liveadd"))
+            .count();
+        assert_eq!(before, 0, "the new directory isn't watched yet");
+
+        store
+            .set_settings(crate::store::Settings {
+                claude_dirs: vec![homes[0].to_string_lossy().to_string()],
+                ..Default::default()
+            })
+            .unwrap();
+
+        // The loop polls settings_gen once per FLUSH_INTERVAL (200ms).
+        let mut found = 0;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(100));
+            found = store
+                .list_sessions(None)
+                .unwrap()
+                .iter()
+                .filter(|s| s.account.as_deref() == Some("liveadd"))
+                .count();
+            if found == 2 {
+                break;
+            }
+        }
+        assert_eq!(found, 2, "both transcripts ingested after the settings change");
+
+        // And a transcript written afterwards is tailed live by the new watcher.
+        let proj = homes[0].join("projects").join("proj");
+        std::fs::write(
+            proj.join("live-1.jsonl"),
+            "{\"type\":\"user\",\"sessionId\":\"live-1\",\"uuid\":\"u-live-1\",\"timestamp\":\"2026-08-08T00:00:00Z\",\"message\":{\"role\":\"user\",\"content\":\"hi\"}}\n",
+        )
+        .unwrap();
+        let mut live = false;
+        for _ in 0..40 {
+            std::thread::sleep(Duration::from_millis(100));
+            live = store
+                .list_sessions(None)
+                .unwrap()
+                .iter()
+                .any(|s| s.id == "cc:live-1");
+            if live {
+                break;
+            }
+        }
+        assert!(live, "a file created after the add is tailed live");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// Real-data smoke test: backfill the actual ~/.claude/projects into a temp
     /// DB (read-only against agent data). Ignored by default — depends on the
     /// machine having transcripts. Run: `cargo test -- --ignored real_backfill`.
@@ -898,6 +1226,28 @@ mod tests {
     #[ignore]
     fn real_backfill_ingests_without_panic() {
         let store = Store::open_in_memory().unwrap();
+        // Optionally exercise the multi-account path against real directories:
+        //   ERIDIAN_TEST_CLAUDE_DIRS="~/.claude-a,~/.claude-b" \
+        //     cargo test -- --ignored real_backfill --nocapture
+        // Kept as an env var so no machine-specific directory name lives in the
+        // repo. Unset → the default ~/.claude root only, as before.
+        if let Ok(extra) = std::env::var("ERIDIAN_TEST_CLAUDE_DIRS") {
+            let dirs: Vec<String> = extra
+                .split(',')
+                .map(str::trim)
+                .filter(|d| !d.is_empty())
+                .map(str::to_string)
+                .collect();
+            store
+                .set_settings(crate::store::Settings {
+                    claude_dirs: dirs,
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        for root in claude_projects_dirs(&store) {
+            eprintln!("root: {}", crate::paths::display_home(&root));
+        }
         let n = backfill(&store, false).unwrap();
         let sessions = store.list_sessions(None).unwrap();
         let status = store.ingest_status().unwrap();
@@ -909,6 +1259,15 @@ mod tests {
         assert!(n > 0, "expected at least one transcript file");
         assert!(!sessions.is_empty(), "expected at least one session");
         assert!(status.claude_code_events > 0, "expected some events");
+        // Per-account rollup (counts only — never session titles or paths).
+        let mut by_account: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for s in &sessions {
+            *by_account
+                .entry(s.account.clone().unwrap_or_else(|| "<default>".into()))
+                .or_default() += 1;
+        }
+        eprintln!("sessions per account: {by_account:?}");
         // Idempotency: a second backfill (simulating restart) adds nothing.
         backfill(&store, false).unwrap();
         let after = store.ingest_status().unwrap();

@@ -9,6 +9,7 @@ import type {
   ActivityBucket,
   SkillRun,
   AppendedPayload,
+  ClaudeDirInfo,
   DbInfo,
   FileContent,
   FileCommit,
@@ -103,6 +104,9 @@ export const api = {
   dbInfo: () => invoke<DbInfo>("db_info"),
   getSettings: () => invoke<Settings>("get_settings"),
   setSettings: (settings: Settings) => invoke<Settings>("set_settings", { settings }),
+  claudeDirsStatus: () => invoke<ClaudeDirInfo[]>("claude_dirs_status"),
+  inspectClaudeDir: (path: string) =>
+    invoke<ClaudeDirInfo>("inspect_claude_dir", { path }),
   rebuildDb: () => invoke<void>("rebuild_db"),
 };
 
