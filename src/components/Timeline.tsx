@@ -283,7 +283,7 @@ export function Timeline({
             {session.account && (
               <span
                 className="tag account"
-                title={`Ingested from the ~/.claude-${session.account} directory`}
+                title={`Claude account: ${session.account}`}
               >
                 {session.account}
               </span>

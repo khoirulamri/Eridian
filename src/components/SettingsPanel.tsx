@@ -31,6 +31,10 @@ export function SettingsPanel() {
   const [dirInput, setDirInput] = useState("");
   const [dirError, setDirError] = useState<string | null>(null);
   const [dirBusy, setDirBusy] = useState(false);
+  // The directory card writes the WHOLE settings object (one settings.json), so
+  // it must not fire before getSettings() has filled the other form fields — a
+  // click in that window would persist a blank backfill limit.
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const [confirmRemove, setConfirmRemove] = useState<ClaudeDirInfo | null>(null);
 
   const loadInfo = () => api.dbInfo().then(setInfo).catch(() => {});
@@ -44,6 +48,7 @@ export function SettingsPanel() {
       setFileLimit(s.backfillFileLimit != null ? String(s.backfillFileLimit) : "");
       setMaxPerAgent(s.maxSessionsPerAgent != null ? String(s.maxSessionsPerAgent) : "");
       setClaudeDirs(s.claudeDirs);
+      setSettingsLoaded(true);
     });
 
     // Keep the Database card (size/sessions/events) in step with the ingest for
@@ -268,7 +273,7 @@ export function SettingsPanel() {
                   <button
                     className="dir-remove"
                     onClick={() => setConfirmRemove(d)}
-                    disabled={dirBusy}
+                    disabled={dirBusy || !settingsLoaded}
                     title={`Stop watching ${d.path}`}
                     aria-label={`Stop watching ${d.path}`}
                   >
@@ -298,7 +303,7 @@ export function SettingsPanel() {
                   <button
                     className="settings-btn"
                     onClick={() => addDir(d.path)}
-                    disabled={dirBusy}
+                    disabled={dirBusy || !settingsLoaded}
                   >
                     Add
                   </button>
@@ -325,7 +330,7 @@ export function SettingsPanel() {
           <button
             className="settings-btn"
             onClick={() => addDir(dirInput)}
-            disabled={dirBusy || !dirInput.trim()}
+            disabled={dirBusy || !settingsLoaded || !dirInput.trim()}
           >
             Add directory
           </button>

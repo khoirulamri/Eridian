@@ -92,6 +92,31 @@ describe("SettingsPanel — watched directories", () => {
     );
   });
 
+  it("won't write settings before the existing ones have loaded", async () => {
+    // Persisting writes the whole settings.json; firing early would save a blank
+    // backfill limit over the user's configured value.
+    let resolveSettings!: (s: Settings) => void;
+    mocked.getSettings.mockReturnValue(
+      new Promise<Settings>((r) => {
+        resolveSettings = r;
+      })
+    );
+    mocked.claudeDirsStatus.mockResolvedValue([
+      dir({ projectCount: 9 }),
+      dir({ path: "~/.claude-work", label: "work", projectCount: 5, kind: "detected" }),
+    ]);
+
+    const { container } = render(<SettingsPanel />);
+    await waitFor(() =>
+      expect(container.querySelector(".dir-detected")).not.toBeNull()
+    );
+    const add = screen.getByRole("button", { name: "Add" }) as HTMLButtonElement;
+    expect(add.disabled).toBe(true);
+
+    resolveSettings(settings({ backfillFileLimit: 42 }));
+    await waitFor(() => expect(add.disabled).toBe(false));
+  });
+
   it("shows an inline error and saves nothing when the path is rejected", async () => {
     mocked.inspectClaudeDir.mockRejectedValue("~/.nope has no projects/ folder.");
     const { container } = render(<SettingsPanel />);

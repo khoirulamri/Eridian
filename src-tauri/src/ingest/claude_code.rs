@@ -1258,7 +1258,11 @@ mod tests {
         );
         assert!(n > 0, "expected at least one transcript file");
         assert!(!sessions.is_empty(), "expected at least one session");
-        assert!(status.claude_code_events > 0, "expected some events");
+        // NOT asserted: an event count. A machine whose ~/.claude/projects only
+        // holds `ai-title` lines (normal once sessions moved to a per-account
+        // CLAUDE_CONFIG_DIR) legitimately yields sessions and zero events. Point
+        // ERIDIAN_TEST_CLAUDE_DIRS at a real account to exercise event ingest;
+        // the idempotency assertion below is the one that holds either way.
         // Per-account rollup (counts only — never session titles or paths).
         let mut by_account: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();

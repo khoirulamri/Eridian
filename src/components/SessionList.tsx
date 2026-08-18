@@ -222,7 +222,7 @@ function SessionRowItem({
           {label}
           {s.isSubagent && <span className="tag">subagent</span>}
           {s.account && (
-            <span className="tag account" title={`Claude directory: ~/.claude-${s.account}`}>
+            <span className="tag account" title={`Claude account: ${s.account}`}>
               {s.account}
             </span>
           )}

@@ -129,11 +129,16 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON").ok();
 
         let settings_path = path.parent().map(|p| p.join("settings.json"));
-        let settings = settings_path
+        let mut settings = settings_path
             .as_ref()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| serde_json::from_str::<Settings>(&s).ok())
             .unwrap_or_default();
+        // settings.json is human-readable and invites hand-editing, so normalize
+        // on load too — not just in set_settings. Otherwise a hand-written
+        // absolute path wouldn't match the display form the UI renders, and
+        // removing that directory in Settings would silently do nothing.
+        settings.claude_dirs = normalize_claude_dirs(&settings.claude_dirs);
         let store = Store {
             inner: std::sync::Arc::new(Inner {
                 conn: Mutex::new(conn),
@@ -1990,6 +1995,38 @@ mod tests {
         };
         let inserted = store.commit_batches("/f.jsonl", 5, vec![batch]).unwrap();
         assert_eq!(inserted.len(), 1);
+    }
+
+    #[test]
+    fn hand_edited_absolute_claude_dirs_are_normalized_on_load() {
+        // settings.json is pretty-printed and 0600 in the app-data dir, so a
+        // user may well edit it by hand. An absolute path written there has to
+        // come back in the same display form the UI shows, or the Settings list
+        // couldn't match it and "stop watching" would silently do nothing.
+        let dir = std::env::temp_dir().join(format!("eridian-loadnorm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let home = dirs::home_dir().unwrap();
+        std::fs::write(
+            dir.join("settings.json"),
+            serde_json::json!({
+                "claudeDirs": [
+                    home.join(".claude-alpha").to_string_lossy(),
+                    "~/.claude-alpha/",      // the same dir, written differently
+                    "not/absolute",
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = Store::open(&dir.join("eridian.db")).unwrap();
+        assert_eq!(
+            store.settings().claude_dirs,
+            vec!["~/.claude-alpha".to_string()],
+            "absolute + duplicate + relative collapse to one display-form entry"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
